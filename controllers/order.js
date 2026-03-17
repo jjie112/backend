@@ -1,40 +1,81 @@
 import orders from '../models/order.js'
 import users from '../models/user.js'
 import { StatusCodes } from 'http-status-codes'
+import products from '../models/product.js'
+import mongoose from 'mongoose'
 
-// 使用者建立訂單 (從購物車結帳)
+// [使用者] 建立訂單 (包含扣庫存邏輯)
 export const createOrder = async (req, res) => {
+  // 啟動資料庫事務，確保扣庫存與建訂單是一體的
+  const session = await mongoose.startSession()
   try {
-    // 1. 檢查購物車是否有東西
-    // 假設你在 auth 攔截器已經把使用者資料存入 req.user 並 populate 了 cart.p_id
-    const user = await users.findById(req.user._id).populate('cart.p_id')
-    if (user.cart.length === 0) throw new Error('EMPTY_CART')
+    session.startTransaction()
 
-    // 2. 計算總金額（避免前端傳入錯誤金額，後端必須重算）
-    const totalPrice = user.cart.reduce((sum, item) => {
-      // 加入安全檢查：如果商品不存在，跳過或視為 0 元
-      const price = item.p_id ? item.p_id.price : 0
-      return sum + price * item.quantity
-    }, 0)
+    // 1. 取得使用者並 populate 購物車商品資訊
+    const user = await users.findById(req.user._id).populate('cart.p_id').session(session)
+    if (!user || user.cart.length === 0) throw new Error('EMPTY_CART')
+
+    let totalPrice = 0
+    const cartItems = []
+
+    // 2. 遍歷購物車檢查庫存並計算金額
+    for (const item of user.cart) {
+      if (!item.p_id || !item.p_id.sell) throw new Error('PRODUCT_NOT_FOUND')
+
+      // 原子化更新：檢查庫存是否充足並同時扣除
+      const updatedProduct = await products.findOneAndUpdate(
+        {
+          _id: item.p_id._id,
+          stock: { $gte: item.quantity }, // 關鍵：庫存必須大於等於購買數量
+        },
+        { $inc: { stock: -item.quantity } }, // 扣除庫存
+        { session, new: true },
+      )
+
+      if (!updatedProduct) {
+        // 如果更新失敗，代表庫存不足
+        throw new Error(`STOCK_INSUFFICIENT_${item.p_id.name}`)
+      }
+
+      totalPrice += item.p_id.price * item.quantity
+      cartItems.push({ p_id: item.p_id._id, quantity: item.quantity })
+    }
 
     // 3. 建立訂單
-    await orders.create({
-      u_id: req.user._id,
-      cart: user.cart,
-      totalPrice,
-    })
+    await orders.create(
+      [
+        {
+          u_id: req.user._id,
+          cart: cartItems,
+          totalPrice,
+        },
+      ],
+      { session },
+    )
 
     // 4. 清空購物車
     user.cart = []
-    await user.save()
+    await user.save({ session })
 
-    res.status(StatusCodes.OK).json({ success: true, message: '' })
+    // 提交所有變更
+    await session.commitTransaction()
+    res.status(StatusCodes.OK).json({ success: true, message: '訂單建立成功' })
   } catch (error) {
+    // 發生錯誤，復原所有資料庫變更
+    await session.abortTransaction()
+
     if (error.message === 'EMPTY_CART') {
       res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: '購物車是空的' })
+    } else if (error.message.startsWith('STOCK_INSUFFICIENT')) {
+      const productName = error.message.replace('STOCK_INSUFFICIENT_', '')
+      res
+        .status(StatusCodes.BAD_REQUEST)
+        .json({ success: false, message: `【${productName}】庫存不足` })
     } else {
       res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({ success: false, message: '伺服器錯誤' })
     }
+  } finally {
+    session.endSession()
   }
 }
 
@@ -52,22 +93,43 @@ export const getOrders = async (req, res) => {
   }
 }
 
-// 使用者更新訂單狀態 (只能取消自己的訂單，且狀態必須是待處理(0))
+// [使用者] 更新訂單狀態 (取消訂單需歸還庫存)
 export const updateOrderStatus = async (req, res) => {
+  const session = await mongoose.startSession()
   try {
-    // 只能取消自己的訂單，且狀態為 0 (待處理) 時才允許取消
-    const result = await orders.findOneAndUpdate(
-      { _id: req.params.id, u_id: req.user._id, status: 0 },
-      // 接把要更新的 status 寫死為 2，防止使用者傳入其他狀態
-      // { status: req.body.status },
-      { status: 2 }, // 直接改為取消，避免前端傳入錯誤狀態
-      { new: true, runValidators: true },
-    )
+    session.startTransaction()
 
-    if (!result) throw new Error('NOT_FOUND')
-    res.status(StatusCodes.OK).json({ success: true, message: '' })
+    // 1. 找出該筆訂單（需為待處理狀態 0）
+    const order = await orders
+      .findOne({
+        _id: req.params.id,
+        u_id: req.user._id,
+        status: 0,
+      })
+      .session(session)
+
+    if (!order) throw new Error('NOT_FOUND_OR_UNMODIFIABLE')
+
+    // 2. 歸還庫存邏輯
+    for (const item of order.cart) {
+      await products.findByIdAndUpdate(
+        item.p_id,
+        { $inc: { stock: item.quantity } }, // 💡 補回庫存
+        { session },
+      )
+    }
+
+    // 3. 更新訂單狀態為已取消 (2)
+    order.status = 2
+    await order.save({ session })
+
+    await session.commitTransaction()
+    res.status(StatusCodes.OK).json({ success: true, message: '訂單已成功取消' })
   } catch (error) {
-    res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: '更新失敗或訂單不存在' })
+    await session.abortTransaction()
+    res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: '取消訂單失敗' })
+  } finally {
+    session.endSession()
   }
 }
 
@@ -109,19 +171,35 @@ export const getAllOrders = async (req, res) => {
   }
 }
 
-// 管理者更新訂單狀態 (可取消、可完成)
+// [管理者] 更新狀態 (管理者手動取消也需考慮還庫存)
 export const adminUpdateOrder = async (req, res) => {
+  const session = await mongoose.startSession()
   try {
-    // 管理者修改不需要檢查 u_id，只要訂單 ID 對即可
-    const result = await orders.findByIdAndUpdate(
-      req.params.id,
-      { status: req.body.status },
-      { new: true, runValidators: true },
-    )
-    if (!result) throw new Error('NOT_FOUND')
-    res.status(StatusCodes.OK).json({ success: true, message: '' })
+    session.startTransaction()
+
+    const order = await orders.findById(req.params.id).session(session)
+    if (!order) throw new Error('NOT_FOUND')
+
+    const newStatus = parseInt(req.body.status)
+
+    // 邏輯：如果管理員把訂單從 0 (待處理) 改為 2 (已取消)，則還庫存
+    if (order.status === 0 && newStatus === 2) {
+      for (const item of order.cart) {
+        await products.findByIdAndUpdate(item.p_id, { $inc: { stock: item.quantity } }, { session })
+      }
+    }
+    // 反向邏輯：如果管理員把 2 (已取消) 改回 0 (待處理)，則需重新扣庫存 (視需求而定)
+
+    order.status = newStatus
+    await order.save({ session })
+
+    await session.commitTransaction()
+    res.status(StatusCodes.OK).json({ success: true, message: '更新成功' })
   } catch (error) {
+    await session.abortTransaction()
     res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: '更新失敗' })
+  } finally {
+    session.endSession()
   }
 }
 
