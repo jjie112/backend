@@ -6,77 +6,72 @@ import mongoose from 'mongoose'
 
 // [使用者] 建立訂單 (包含扣庫存邏輯)
 export const createOrder = async (req, res) => {
+  // 啟動 Session
+  const session = await mongoose.startSession()
+
   try {
-    console.log('--- 結帳流程開始 ---')
+    // 開始事務 (Transaction)
+    session.startTransaction()
 
-    // 1. 抓取使用者，確認購物車
-    const user = await users.findById(req.user._id).populate('cart.p_id')
-    console.log('當前購物車項目數量:', user.cart.length)
-
-    if (!user || user.cart.length === 0) {
-      console.log('錯誤: 購物車為空')
-      throw new Error('EMPTY_CART')
-    }
+    const user = await users.findById(req.user._id).populate('cart.p_id').session(session)
+    if (!user || user.cart.length === 0) throw new Error('EMPTY_CART')
 
     let totalPrice = 0
     const cartItems = []
 
-    // 2. 遍歷購物車，逐一扣庫存
     for (const item of user.cart) {
-      console.log(
-        `正在處理商品: ${item.p_id.name}, 購買數量: ${item.quantity}, 目前庫存: ${item.p_id.stock}`,
-      )
-
-      // 💡 關鍵檢查：執行扣除動作
+      // 在 findOneAndUpdate 中加入 .session(session)
       const updatedProduct = await products.findOneAndUpdate(
         {
           _id: item.p_id._id,
           stock: { $gte: item.quantity },
         },
-        {
-          $inc: { stock: -item.quantity },
-        },
-        { new: true }, // 返回更新後的資料
+        { $inc: { stock: -item.quantity } },
+        { session, new: true }, // 👈 關鍵：加入 session
       )
 
       if (!updatedProduct) {
-        console.log(`失敗: 商品 ${item.p_id.name} 庫存不足或 ID 錯誤`)
         throw new Error(`STOCK_INSUFFICIENT_${item.p_id.name}`)
       }
-
-      console.log(`成功: 商品 ${item.p_id.name} 扣除後剩餘庫存: ${updatedProduct.stock}`)
 
       totalPrice += item.p_id.price * item.quantity
       cartItems.push({ p_id: item.p_id._id, quantity: item.quantity })
     }
 
-    // 3. 建立訂單
-    const newOrder = await orders.create({
-      u_id: req.user._id,
-      cart: cartItems,
-      totalPrice,
-    })
-    console.log('訂單建立成功，ID:', newOrder._id)
+    // 建立訂單
+    await orders.create(
+      [
+        {
+          u_id: req.user._id,
+          cart: cartItems,
+          totalPrice,
+        },
+      ],
+      { session },
+    ) // 👈 關鍵：加入 session
 
-    // 4. 清空購物車
+    // 清空購物車
     user.cart = []
-    await user.save()
-    console.log('使用者購物車已清空')
+    await user.save({ session })
+
+    // 只有執行到這行，前面的所有資料庫改動才會真正生效
+    await session.commitTransaction()
 
     res.status(StatusCodes.OK).json({ success: true, message: '訂單建立成功' })
-    console.log('--- 結帳流程結束 ---')
   } catch (error) {
-    console.error('結帳過程發生錯誤:', error.message)
-    if (error.message === 'EMPTY_CART') {
-      res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: '購物車是空的' })
-    } else if (error.message.startsWith('STOCK_INSUFFICIENT')) {
-      const productName = error.message.replace('STOCK_INSUFFICIENT_', '')
-      res
-        .status(StatusCodes.BAD_REQUEST)
-        .json({ success: false, message: `【${productName}】庫存不足` })
-    } else {
-      res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({ success: false, message: '伺服器錯誤' })
-    }
+    // 發生任何錯誤（包括庫存不足），撤銷前面所有的動作（Rollback）
+    await session.abortTransaction()
+
+    console.error('交易失敗，已回滾：', error.message)
+
+    const msg = error.message.startsWith('STOCK_INSUFFICIENT')
+      ? `商品【${error.message.split('_')[2]}】庫存不足`
+      : '結帳失敗'
+
+    res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: msg })
+  } finally {
+    // 結束 Session
+    session.endSession()
   }
 }
 
