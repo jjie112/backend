@@ -165,7 +165,7 @@ export const removeCartItem = async (req, res) => {
 // 續期 Token (無感刷新)
 export const extend = async (req, res) => {
   try {
-    // 💡 確保從 req.user._id 拿 ID (這是 middleware/auth.js 傳進來的)
+    // 確保從 req.user._id 拿 ID (這是 middleware/auth.js 傳進來的)
     const user = await User.findById(req.user._id).select('+tokens')
 
     if (!user) {
@@ -189,9 +189,34 @@ export const extend = async (req, res) => {
 
     res.status(StatusCodes.OK).json({
       success: true,
-      result: token, // 💡 這裡對應前端 api.js 的 data.result
+      result: token, // 這裡對應前端 api.js 的 data.result
     })
   } catch (error) {
     res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({ success: false, message: error.message })
+  }
+}
+
+// 獲取所有會員及其訂單 (管理員專用)
+export const getAllUsers = async (req, res) => {
+  try {
+    // 獲取所有使用者，排除敏感資料(password 和 tokens 欄位)及購物車，並同時計算他們的訂單數量（可選）
+    const users = await User.find().select('-password -tokens -cart')
+    res.status(StatusCodes.OK).json({ success: true, data: users })
+  } catch (error) {
+    res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({ success: false, message: '獲取會員失敗' })
+  }
+}
+
+// 刪除會員
+export const deleteUser = async (req, res) => {
+  try {
+    // 禁止刪除管理員自己 (安全性檢查)
+    if (req.params.id === req.user._id.toString()) {
+      return res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: '不能刪除自己' })
+    }
+    await User.findByIdAndDelete(req.params.id)
+    res.status(StatusCodes.OK).json({ success: true, message: '會員已刪除' })
+  } catch (error) {
+    res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({ success: false, message: '刪除失敗' })
   }
 }

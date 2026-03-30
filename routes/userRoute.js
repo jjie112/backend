@@ -16,6 +16,11 @@ router.delete('/logout', auth.token, user.logout)
 // 前端會在收到 401 時，自動呼叫這條路徑來換新 Token
 router.patch('/extend', auth.extend, user.extend)
 
+// 管理員存取會員資料
+router.get('/all', auth.token, auth.admin, user.getAllUsers)
+// 管理員刪除會員
+router.delete('/:id', auth.token, auth.admin, user.deleteUser)
+
 // 購物車相關
 router.get('/cart', auth.token, user.getCart)
 router.post('/cart', auth.token, user.editCart)
